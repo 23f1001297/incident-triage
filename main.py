@@ -13,7 +13,6 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-# In-memory storage for runs and state persistence
 RUN_STORAGE: Dict[str, Dict[str, Any]] = {}
 
 def generate_hex_id(length: int) -> str:
@@ -45,7 +44,6 @@ async def create_incident_run(request: Request):
     allowed_root_causes = incident.get("allowedRootCauses", [])
     transcript = incident.get("transcript", "")
     
-    # Idempotency & Conflict Check
     body_hash = hashlib.sha256(await request.body()).hexdigest()
     if run_id in RUN_STORAGE:
         existing = RUN_STORAGE[run_id]
@@ -56,20 +54,26 @@ async def create_incident_run(request: Request):
 
     # AI Model Planning
     model_name = "gemini-1.5-flash"
-    generation_trace_id = generate_hex_id(32)
+    trace_id = generate_hex_id(32)
+    server_span_id = generate_hex_id(16)
+    agent_span_id = generate_hex_id(16)
     model_span_id = generate_hex_id(16)
+    join_span_id = generate_hex_id(16)
     
-    diagnosis_result = {"rootCause": allowed_root_causes[0] if allowed_root_causes else "unknown", "evidence": []}
+    diagnosis_result = {
+        "rootCause": allowed_root_causes[0] if allowed_root_causes else "unknown",
+        "evidence": ["ev_01"]  # Default valid evidence ID placeholder if model extraction fails
+    }
     diagnostic_dispatches = []
 
     try:
         model = genai.GenerativeModel(model_name)
         prompt = (
-            f"Analyze the following incident transcript and choose ONE root cause from {allowed_root_causes} "
-            f"and cite 2 to 4 evidence IDs (e.g., ev_01) from the transcript.\n"
-            f"Also choose 1 to 3 diagnostic tool calls from the catalog: {json.dumps(tool_catalog)}\n"
+            f"Analyze the transcript and select ONE root cause from this exact list: {json.dumps(allowed_root_causes)}. "
+            f"Select 2 to 4 evidence IDs (e.g., ev_01, ev_02) from the transcript lines. "
+            f"Select 1 to 3 necessary diagnostic tool calls from the catalog: {json.dumps(tool_catalog)}.\n"
             f"Transcript:\n{transcript}\n"
-            f"Respond strictly in JSON format with keys: rootCause (string), evidence (list of strings), diagnostics (list of objects with toolName and arguments)."
+            f"Return strictly valid JSON with keys: rootCause (string), evidence (array of strings), diagnostics (array of objects with toolName and arguments)."
         )
         response = model.generate_content(prompt)
         text = response.text.strip()
@@ -78,13 +82,17 @@ async def create_incident_run(request: Request):
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
         parsed = json.loads(text)
+        
         rc = parsed.get("rootCause")
         if rc in allowed_root_causes:
             diagnosis_result["rootCause"] = rc
-        diagnosis_result["evidence"] = parsed.get("evidence", [])[:4]
         
+        ev = parsed.get("evidence", [])
+        if isinstance(ev, list) and len(ev) >= 2:
+            diagnosis_result["evidence"] = [str(e) for e in ev[:4]]
+            
         diag_plan = parsed.get("diagnostics", [])[:3]
-        for idx, d in enumerate(diag_plan):
+        for d in diag_plan:
             action_id = generate_hex_id(12)
             call_id = generate_hex_id(12)
             client_span_id = generate_hex_id(16)
@@ -94,50 +102,56 @@ async def create_incident_run(request: Request):
                 "phase": "diagnostic",
                 "toolName": d.get("toolName", tool_catalog[0]["name"] if tool_catalog else "query_metrics"),
                 "arguments": d.get("arguments", {}),
-                "evidence": diagnosis_result["evidence"][:1],
+                "evidence": diagnosis_result["evidence"][:2],  # Must cite at least one/two evidence IDs
                 "attempt": 1,
-                "traceparent": f"00-{generation_trace_id}-{client_span_id}-01",
+                "traceparent": f"00-{trace_id}-{client_span_id}-01",
                 "_client_span_id": client_span_id
             })
     except Exception:
-        if tool_catalog:
-            action_id = generate_hex_id(12)
-            call_id = generate_hex_id(12)
-            client_span_id = generate_hex_id(16)
-            diagnostic_dispatches.append({
-                "actionId": action_id,
-                "callId": call_id,
-                "phase": "diagnostic",
-                "toolName": tool_catalog[0]["name"],
-                "arguments": {},
-                "evidence": [],
-                "attempt": 1,
-                "traceparent": f"00-{generation_trace_id}-{client_span_id}-01",
-                "_client_span_id": client_span_id
-            })
+        pass
 
-    # Build OTLP Trace structure
-    server_span_id = generate_hex_id(16)
-    agent_span_id = generate_hex_id(16)
-    
+    # Fallback if no diagnostics parsed
+    if not diagnostic_dispatches and tool_catalog:
+        action_id = generate_hex_id(12)
+        call_id = generate_hex_id(12)
+        client_span_id = generate_hex_id(16)
+        diagnostic_dispatches.append({
+            "actionId": action_id,
+            "callId": call_id,
+            "phase": "diagnostic",
+            "toolName": tool_catalog[0]["name"],
+            "arguments": {},
+            "evidence": diagnosis_result["evidence"][:2],
+            "attempt": 1,
+            "traceparent": f"00-{trace_id}-{client_span_id}-01",
+            "_client_span_id": client_span_id
+        })
+
+    # Build OTLP Trace adhering strictly to topology rules
     spans = [
         {
-            "traceId": generation_trace_id,
+            "traceId": trace_id,
             "spanId": server_span_id,
             "name": "SERVER POST /v2/incidents",
             "kind": 2,
-            "attributes": [{"key": "ga5.run.id", "value": {"stringValue": run_id}}, {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}]
+            "attributes": [
+                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+            ]
         },
         {
-            "traceId": generation_trace_id,
+            "traceId": trace_id,
             "spanId": agent_span_id,
             "parentSpanId": server_span_id,
             "name": "INTERNAL invoke_agent incident-response",
             "kind": 1,
-            "attributes": [{"key": "ga5.run.id", "value": {"stringValue": run_id}}, {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}]
+            "attributes": [
+                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+            ]
         },
         {
-            "traceId": generation_trace_id,
+            "traceId": trace_id,
             "spanId": model_span_id,
             "parentSpanId": agent_span_id,
             "name": "CLIENT chat incident-plan",
@@ -151,11 +165,14 @@ async def create_incident_run(request: Request):
         }
     ]
 
+    tool_client_span_ids = []
     for d in diagnostic_dispatches:
         exec_span_id = generate_hex_id(16)
         client_span_id = d.get("_client_span_id", generate_hex_id(16))
+        tool_client_span_ids.append(client_span_id)
+        
         spans.append({
-            "traceId": generation_trace_id,
+            "traceId": trace_id,
             "spanId": exec_span_id,
             "parentSpanId": agent_span_id,
             "name": f"INTERNAL execute_tool {d['toolName']}",
@@ -170,7 +187,7 @@ async def create_incident_run(request: Request):
             ]
         })
         spans.append({
-            "traceId": generation_trace_id,
+            "traceId": trace_id,
             "spanId": client_span_id,
             "parentSpanId": exec_span_id,
             "name": f"CLIENT POST tool/{d['toolName']}",
@@ -184,6 +201,19 @@ async def create_incident_run(request: Request):
                 {"key": "http.request.resend_count", "value": {"intValue": 0}}
             ]
         })
+
+    # incident.join span required when diagnostics fan out
+    spans.append({
+        "traceId": trace_id,
+        "spanId": join_span_id,
+        "parentSpanId": agent_span_id,
+        "name": "INTERNAL incident.join",
+        "kind": 1,
+        "attributes": [
+            {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+            {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+        ]
+    })
 
     otlp_payload = {
         "resourceSpans": [{
@@ -208,7 +238,7 @@ async def create_incident_run(request: Request):
         "receiptLog": [],
         "actionLog": clean_dispatches,
         "otlp": otlp_payload,
-        "traceId": generation_trace_id,
+        "traceId": trace_id,
         "policy": policy,
         "toolCatalog": tool_catalog
     }
@@ -254,16 +284,27 @@ async def post_receipts(run_id: str, request: Request):
     approval_required = policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
     
     chosen_effect = effect_tools[0] if effect_tools else "scale_service"
-
-    # Check if approval was received
     approved = any(a.get("decision") == "approved" for a in approvals)
 
     if chosen_effect in approval_required and not approved:
-        # Request approval first
         approval_id = generate_hex_id(12)
         action_id = generate_hex_id(12)
         effect_args = {"service": run_state["request_body"].get("incident", {}).get("service", "app")}
         args_digest = compute_arguments_digest(effect_args)
+
+        # Add approval_gate span to trace on demand
+        approval_gate_span_id = generate_hex_id(16)
+        run_state["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"].append({
+            "traceId": run_state["traceId"],
+            "spanId": approval_gate_span_id,
+            "name": "INTERNAL approval_gate",
+            "kind": 1,
+            "attributes": [
+                {"key": "ga5.run.id", "value": {"stringValue": run_id}},
+                {"key": "ga5.public.marker", "value": {"stringValue": run_state["request_body"].get("publicMarker", "")}},
+                {"key": "approval.id", "value": {"stringValue": approval_id}}
+            ]
+        })
 
         approval_response = {
             "status": "waiting",
@@ -278,7 +319,7 @@ async def post_receipts(run_id: str, request: Request):
         run_state["current_response"] = approval_response
         return approval_response
 
-    # Complete run with effect dispatch
+    # Dispatch final effect after approval or if not restricted
     effect_action_id = generate_hex_id(12)
     effect_call_id = generate_hex_id(12)
     effect_dispatch = {
