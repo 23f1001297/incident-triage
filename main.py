@@ -4,7 +4,6 @@ import hashlib
 import uuid
 from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, Response, HTTPException, status
-from pydantic import BaseModel, Field
 import google.generativeai as genai
 
 app = FastAPI(title="Observable Incident Agent", version="v2")
@@ -62,7 +61,7 @@ async def create_incident_run(request: Request):
     
     diagnosis_result = {
         "rootCause": allowed_root_causes[0] if allowed_root_causes else "unknown",
-        "evidence": ["ev_01"]  # Default valid evidence ID placeholder if model extraction fails
+        "evidence": ["ev_01"]
     }
     diagnostic_dispatches = []
 
@@ -70,7 +69,7 @@ async def create_incident_run(request: Request):
         model = genai.GenerativeModel(model_name)
         prompt = (
             f"Analyze the transcript and select ONE root cause from this exact list: {json.dumps(allowed_root_causes)}. "
-            f"Select 2 to 4 evidence IDs (e.g., ev_01, ev_02) from the transcript lines. "
+            f"Select 2 to 4 evidence IDs from the transcript lines. "
             f"Select 1 to 3 necessary diagnostic tool calls from the catalog: {json.dumps(tool_catalog)}.\n"
             f"Transcript:\n{transcript}\n"
             f"Return strictly valid JSON with keys: rootCause (string), evidence (array of strings), diagnostics (array of objects with toolName and arguments)."
@@ -102,7 +101,7 @@ async def create_incident_run(request: Request):
                 "phase": "diagnostic",
                 "toolName": d.get("toolName", tool_catalog[0]["name"] if tool_catalog else "query_metrics"),
                 "arguments": d.get("arguments", {}),
-                "evidence": diagnosis_result["evidence"][:2],  # Must cite at least one/two evidence IDs
+                "evidence": diagnosis_result["evidence"][:2],
                 "attempt": 1,
                 "traceparent": f"00-{trace_id}-{client_span_id}-01",
                 "_client_span_id": client_span_id
@@ -110,7 +109,6 @@ async def create_incident_run(request: Request):
     except Exception:
         pass
 
-    # Fallback if no diagnostics parsed
     if not diagnostic_dispatches and tool_catalog:
         action_id = generate_hex_id(12)
         call_id = generate_hex_id(12)
@@ -127,7 +125,6 @@ async def create_incident_run(request: Request):
             "_client_span_id": client_span_id
         })
 
-    # Build OTLP Trace adhering strictly to topology rules
     spans = [
         {
             "traceId": trace_id,
@@ -165,12 +162,9 @@ async def create_incident_run(request: Request):
         }
     ]
 
-    tool_client_span_ids = []
     for d in diagnostic_dispatches:
         exec_span_id = generate_hex_id(16)
         client_span_id = d.get("_client_span_id", generate_hex_id(16))
-        tool_client_span_ids.append(client_span_id)
-        
         spans.append({
             "traceId": trace_id,
             "spanId": exec_span_id,
@@ -202,7 +196,6 @@ async def create_incident_run(request: Request):
             ]
         })
 
-    # incident.join span required when diagnostics fan out
     spans.append({
         "traceId": trace_id,
         "spanId": join_span_id,
@@ -292,7 +285,6 @@ async def post_receipts(run_id: str, request: Request):
         effect_args = {"service": run_state["request_body"].get("incident", {}).get("service", "app")}
         args_digest = compute_arguments_digest(effect_args)
 
-        # Add approval_gate span to trace on demand
         approval_gate_span_id = generate_hex_id(16)
         run_state["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"].append({
             "traceId": run_state["traceId"],
@@ -319,7 +311,6 @@ async def post_receipts(run_id: str, request: Request):
         run_state["current_response"] = approval_response
         return approval_response
 
-    # Dispatch final effect after approval or if not restricted
     effect_action_id = generate_hex_id(12)
     effect_call_id = generate_hex_id(12)
     effect_dispatch = {
