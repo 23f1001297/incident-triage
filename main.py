@@ -8,9 +8,8 @@ from typing import Dict, Any, List, Optional
 from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Observable Incident Agent - Fully Compliant")
+app = FastAPI(title="Observable Incident Agent - Hardened & Gated")
 
-# In-Memory Storage
 runs_db: Dict[str, Dict[str, Any]] = {}
 run_payload_hashes: Dict[str, str] = {}
 LOCK = asyncio.Lock()
@@ -36,7 +35,7 @@ async def create_incident(request: Request):
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing runId.")
 
-    # Exclude sensitive fields from payload hash and storage
+    # Exclude sensitive data from hashing and storage to prevent leaks
     body_for_hashing = body.copy()
     body_for_hashing.pop("sensitive", None)
     body_hash = canonical_json_hash(body_for_hashing)
@@ -55,10 +54,8 @@ async def create_incident(request: Request):
         effect_tools = policy.get("effectTools", ["scale_service"])
         public_marker = body.get("publicMarker", "safe")
 
-        # Pick exact allowed root cause
         root_cause = allowed_causes[0] if allowed_causes else "unknown"
         
-        # Extract evidence IDs from transcript (2 to 4 required)
         ev_matches = re.findall(r'\[(ev_[^\]]+)\]', transcript)
         if not ev_matches:
             ev_matches = ["ev_default_1", "ev_default_2"]
@@ -106,7 +103,8 @@ async def create_incident(request: Request):
             "client_span_id": client_span_id,
             "actionLog": list(dispatches),
             "receiptLog": [],
-            "body": body
+            "body": body,
+            "approvalState": None
         }
 
         return JSONResponse(content=response_data, headers={"Content-Type": "application/json"})
@@ -128,11 +126,60 @@ async def post_receipts(runId: str, request: Request):
 
         state = runs_db[runId]
         internal = state.get("_internal_context", {})
-        
+        policy = internal.get("body", {}).get("policy", {})
+        effect_tools = policy.get("effectTools", ["scale_service"])
+        approval_required_for = policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
+
         if state["status"] in ["completed", "failed"]:
             return JSONResponse(content=state, headers={"Content-Type": "application/json"})
 
-        # Record incoming outcomes
+        # Handle incoming approvals response from grader
+        if approvals_receipt:
+            app_decision = approvals_receipt[0]
+            approval_id = app_decision.get("approvalId")
+            decision = app_decision.get("decision")
+            nonce = app_decision.get("nonce")
+
+            internal["receiptLog"].append({
+                "receiptId": receipt_id,
+                "approvalId": approval_id,
+                "decision": decision,
+                "nonce": nonce
+            })
+
+            if decision == "approved":
+                effect_tool = effect_tools[0] if effect_tools else "scale_service"
+                action_id = f"act_effect_{uuid.uuid4().hex[:10]}"
+                call_id = f"call_effect_{uuid.uuid4().hex[:10]}"
+                trace_id = internal["trace_id"]
+                client_span_id = generate_hex_id(8)
+
+                effect_dispatch = {
+                    "actionId": action_id,
+                    "callId": call_id,
+                    "phase": "effect",
+                    "toolName": effect_tool,
+                    "arguments": {"action": "execute"},
+                    "evidence": state["diagnosis"]["evidence"],
+                    "attempt": 1,
+                    "traceparent": f"00-{trace_id}-{client_span_id}-01"
+                }
+                internal["actionLog"].append(effect_dispatch)
+                state["dispatches"] = [effect_dispatch]
+                state["approvals"] = []
+                internal["approvalState"] = {
+                    "approvalId": approval_id,
+                    "nonce": nonce,
+                    "actionId": action_id
+                }
+                return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+            else:
+                state["status"] = "failed"
+                state["dispatches"] = []
+                state["approvals"] = []
+                return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+
+        # Handle diagnostic outcomes
         for outcome in outcomes:
             action_id = outcome.get("actionId")
             call_id = outcome.get("callId")
@@ -154,32 +201,47 @@ async def post_receipts(runId: str, request: Request):
         has_pending_effect = any(d.get("phase") == "effect" for d in internal["actionLog"])
         
         if not has_pending_effect:
-            # Diagnostics complete -> Dispatch effect tool
-            policy = internal.get("body", {}).get("policy", {})
-            effect_tools = policy.get("effectTools", ["scale_service"])
             effect_tool = effect_tools[0] if effect_tools else "scale_service"
+            
+            # Check if effect requires approval
+            if effect_tool in approval_required_for and not internal.get("approvalState"):
+                approval_id = f"app_{uuid.uuid4().hex[:10]}"
+                action_id_effect = f"act_eff_{uuid.uuid4().hex[:10]}"
+                args_compact = json.dumps({"action": "execute"}, sort_keys=True, separators=(',', ':'))
+                args_digest = hashlib.sha256(args_compact.encode('utf-8')).hexdigest()
 
-            action_id = f"act_effect_{uuid.uuid4().hex[:10]}"
-            call_id = f"call_effect_{uuid.uuid4().hex[:10]}"
-            trace_id = internal["trace_id"]
-            client_span_id = generate_hex_id(8)
+                state["status"] = "waiting"
+                state["dispatches"] = []
+                state["approvals"] = [{
+                    "approvalId": approval_id,
+                    "actionId": action_id_effect,
+                    "toolName": effect_tool,
+                    "argumentsDigest": args_digest
+                }]
+                return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+            else:
+                # Dispatch effect directly if no approval required
+                action_id = f"act_effect_{uuid.uuid4().hex[:10]}"
+                call_id = f"call_effect_{uuid.uuid4().hex[:10]}"
+                trace_id = internal["trace_id"]
+                client_span_id = generate_hex_id(8)
 
-            effect_dispatch = {
-                "actionId": action_id,
-                "callId": call_id,
-                "phase": "effect",
-                "toolName": effect_tool,
-                "arguments": {"action": "execute"},
-                "evidence": state["diagnosis"]["evidence"],
-                "attempt": 1,
-                "traceparent": f"00-{trace_id}-{client_span_id}-01"
-            }
-            internal["actionLog"].append(effect_dispatch)
-            state["dispatches"] = [effect_dispatch]
-            state["approvals"] = []
-            return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+                effect_dispatch = {
+                    "actionId": action_id,
+                    "callId": call_id,
+                    "phase": "effect",
+                    "toolName": effect_tool,
+                    "arguments": {"action": "execute"},
+                    "evidence": state["diagnosis"]["evidence"],
+                    "attempt": 1,
+                    "traceparent": f"00-{trace_id}-{client_span_id}-01"
+                }
+                internal["actionLog"].append(effect_dispatch)
+                state["dispatches"] = [effect_dispatch]
+                state["approvals"] = []
+                return JSONResponse(content=state, headers={"Content-Type": "application/json"})
         else:
-            # Final completion with precise OTLP spans and full correlation
+            # Completed state: Build OTLP trace (strictly omitting arguments/results)
             trace_id = internal["trace_id"]
             public_marker = internal.get("publicMarker", "safe")
             
@@ -187,13 +249,14 @@ async def post_receipts(runId: str, request: Request):
             agent_span_id = generate_hex_id(8)
             model_span_id = generate_hex_id(8)
             join_span_id = generate_hex_id(8)
+            approval_gate_span_id = generate_hex_id(8)
 
             spans = [
                 {
                     "traceId": trace_id,
                     "spanId": server_span_id,
                     "name": "POST /v2/incidents",
-                    "kind": 2, # SERVER
+                    "kind": 2,
                     "status": {"code": 1}
                 },
                 {
@@ -201,7 +264,7 @@ async def post_receipts(runId: str, request: Request):
                     "spanId": agent_span_id,
                     "parentSpanId": server_span_id,
                     "name": "invoke_agent incident-response",
-                    "kind": 1, # INTERNAL
+                    "kind": 1,
                     "attributes": [
                         {"key": "ga5.run.id", "value": {"stringValue": runId}},
                         {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
@@ -212,7 +275,7 @@ async def post_receipts(runId: str, request: Request):
                     "spanId": model_span_id,
                     "parentSpanId": agent_span_id,
                     "name": "chat incident-plan",
-                    "kind": 3, # CLIENT
+                    "kind": 3,
                     "attributes": [
                         {"key": "ga5.run.id", "value": {"stringValue": runId}},
                         {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
@@ -225,7 +288,7 @@ async def post_receipts(runId: str, request: Request):
                     "spanId": join_span_id,
                     "parentSpanId": agent_span_id,
                     "name": "incident.join",
-                    "kind": 1, # INTERNAL
+                    "kind": 1,
                     "attributes": [
                         {"key": "ga5.run.id", "value": {"stringValue": runId}},
                         {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
@@ -233,14 +296,28 @@ async def post_receipts(runId: str, request: Request):
                 }
             ]
 
-            # Correlate action logs and receipt nonces in client spans
+            if internal.get("approvalState"):
+                app_state = internal["approvalState"]
+                spans.append({
+                    "traceId": trace_id,
+                    "spanId": approval_gate_span_id,
+                    "parentSpanId": agent_span_id,
+                    "name": "approval_gate",
+                    "kind": 1,
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                        {"key": "approval.id", "value": {"stringValue": app_state["approvalId"]}},
+                        {"key": "approval.nonce", "value": {"stringValue": app_state["nonce"]}}
+                    ]
+                })
+
             for idx, dispatch in enumerate(internal["actionLog"]):
                 client_span_id = generate_hex_id(8)
                 tool_name = dispatch["toolName"]
                 action_id = dispatch["actionId"]
                 attempt = dispatch["attempt"]
                 
-                # Find matching receipt nonce if available
                 matching_receipt = next((r for r in internal["receiptLog"] if r.get("actionId") == action_id), {})
                 nonce = matching_receipt.get("nonce", "")
 
@@ -260,7 +337,7 @@ async def post_receipts(runId: str, request: Request):
                     "spanId": client_span_id,
                     "parentSpanId": agent_span_id,
                     "name": f"POST tool/{tool_name}",
-                    "kind": 3, # CLIENT
+                    "kind": 3,
                     "attributes": attrs
                 })
 
@@ -272,12 +349,10 @@ async def post_receipts(runId: str, request: Request):
                 }]
             }
 
-            policy = internal.get("body", {}).get("policy", {})
-            effect_tools = policy.get("effectTools", ["scale_service"])
-            chosen_effect = effect_tools[0] if effect_tools else "scale_service"
+            effect_tool = effect_tools[0] if effect_tools else "scale_service"
 
             state["status"] = "completed"
-            state["chosenEffect"] = chosen_effect
+            state["chosenEffect"] = effect_tool
             state["suppressed"] = []
             state["actionLog"] = internal["actionLog"]
             state["receiptLog"] = internal["receiptLog"]
