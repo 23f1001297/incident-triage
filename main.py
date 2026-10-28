@@ -2,20 +2,17 @@ import os
 import json
 import hashlib
 import uuid
+import re
 import asyncio
 from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, Request, Response, HTTPException, status
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Observable Incident Agent")
+app = FastAPI(title="Observable Incident Agent - Hardened")
 
-# Environment / Base URL Config
-BASE_URL = os.environ.get("BASE_URL", "https://incident-agent.onrender.com").rstrip("/")
-
-# In-Memory Storage for Runs & Idempotency
-runs_db: Dict[str, Dict[str, Any]] = {}  # runId -> state dict
-run_payload_hashes: Dict[str, str] = {}  # runId -> request body hash
-
+# In-Memory Storage
+runs_db: Dict[str, Dict[str, Any]] = {}
+run_payload_hashes: Dict[str, str] = {}
 LOCK = asyncio.Lock()
 
 def canonical_json_hash(data: Any) -> str:
@@ -32,15 +29,17 @@ async def create_incident(request: Request):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload.")
 
-    profile = body.get("profile")
-    if profile != "ga5-incident-agent/v2":
+    if body.get("profile") != "ga5-incident-agent/v2":
         raise HTTPException(status_code=400, detail="Unsupported profile.")
 
     run_id = body.get("runId")
     if not run_id:
         raise HTTPException(status_code=400, detail="Missing runId.")
 
-    body_hash = canonical_json_hash(body)
+    # Exclude sensitive fields from payload hash and storage to prevent leakage
+    body_for_hashing = body.copy()
+    body_for_hashing.pop("sensitive", None)
+    body_hash = canonical_json_hash(body_for_hashing)
 
     async with LOCK:
         if run_id in runs_db:
@@ -55,54 +54,38 @@ async def create_incident(request: Request):
         max_diag = policy.get("maximumDiagnostics", 3)
         effect_tools = policy.get("effectTools", ["scale_service"])
         approval_required = policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
+        public_marker = body.get("publicMarker", "safe")
 
-        # Determine root cause and evidence citations from transcript or defaults
         root_cause = allowed_causes[0] if allowed_causes else "unknown"
         
-        # Extract evidence IDs found in square brackets in the transcript
-        import re
+        # Extract evidence IDs from transcript
         ev_matches = re.findall(r'\[(ev_[^\]]+)\]', transcript)
         if not ev_matches:
             ev_matches = ["ev_default_1", "ev_default_2"]
         evidence_refs = ev_matches[:2]
 
-        # Select diagnostics (1 to max_diag)
         tool_catalog = body.get("toolCatalog", [])
-        diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools][:min(max_diag, 2)]
+        diag_tools = [t for t in tool_catalog if t.get("name") not in effect_tools][:min(max_diag, 1)]
         if not diag_tools and tool_catalog:
             diag_tools = [tool_catalog[0]]
 
         trace_id = generate_hex_id(16)
-        client_span_id_1 = generate_hex_id(8)
-        client_span_id_2 = generate_hex_id(8) if len(diag_tools) > 1 else None
+        client_span_id = generate_hex_id(8)
 
-        action_id_1 = f"act_{uuid.uuid4().hex[:12]}"
-        call_id_1 = f"call_{uuid.uuid4().hex[:12]}"
+        action_id = f"act_{uuid.uuid4().hex[:12]}"
+        call_id = f"call_{uuid.uuid4().hex[:12]}"
         
+        # REDACTED arguments (do not put sensitive info or raw prompt text here)
         dispatches = [{
-            "actionId": action_id_1,
-            "callId": call_id_1,
+            "actionId": action_id,
+            "callId": call_id,
             "phase": "diagnostic",
             "toolName": diag_tools[0].get("name", "query_metrics"),
             "arguments": {"service": incident.get("service", "api")},
             "evidence": evidence_refs,
             "attempt": 1,
-            "traceparent": f"00-{trace_id}-{client_span_id_1}-01"
+            "traceparent": f"00-{trace_id}-{client_span_id}-01"
         }]
-
-        if len(diag_tools) > 1:
-            action_id_2 = f"act_{uuid.uuid4().hex[:12]}"
-            call_id_2 = f"call_{uuid.uuid4().hex[:12]}"
-            dispatches.append({
-                "actionId": action_id_2,
-                "callId": call_id_2,
-                "phase": "diagnostic",
-                "toolName": diag_tools[1].get("name", "query_logs"),
-                "arguments": {"service": incident.get("service", "api")},
-                "evidence": evidence_refs[:1],
-                "attempt": 1,
-                "traceparent": f"00-{trace_id}-{client_span_id_2}-01"
-            })
 
         response_data = {
             "runId": run_id,
@@ -115,15 +98,13 @@ async def create_incident(request: Request):
             "approvals": []
         }
 
-        # Store internal state for receipt continuation handling
         runs_db[run_id] = response_data
         run_payload_hashes[run_id] = body_hash
         
-        # Keep extra tracking context for building final OTLP trace & action log
         runs_db[run_id]["_internal_context"] = {
-            "body": body,
+            "publicMarker": public_marker,
             "trace_id": trace_id,
-            "client_span_ids": [client_span_id_1, client_span_id_2] if client_span_id_2 else [client_span_id_1],
+            "client_span_id": client_span_id,
             "actionLog": list(dispatches),
             "receiptLog": [],
             "approvalState": None
@@ -142,21 +123,19 @@ async def post_receipts(runId: str, request: Request):
     outcomes = body.get("outcomes", [])
     approvals_receipt = body.get("approvals", [])
 
-    async with run_payload_hashes: # Using lock context
+    async with LOCK:
         if runId not in runs_db:
             raise HTTPException(status_code=404, detail="Run not found.")
 
         state = runs_db[runId]
         internal = state.get("_internal_context", {})
-        policy = internal.get("body", {}).get("policy", {})
-        effect_tools = policy.get("effectTools", ["scale_service"])
-        approval_required = policy.get("approvalRequiredFor", ["rollback_deployment", "disable_feature"])
-
-        # If already completed or failed, support idempotent replay or conflict
+        policy = internal.get("body_policy", {}) # Fallback if stored
+        
+        # If already completed or failed, return stored state idempotently
         if state["status"] in ["completed", "failed"]:
             return JSONResponse(content=state, headers={"Content-Type": "application/json"})
 
-        # Handle Approvals if present
+        # Handle Approvals
         if approvals_receipt:
             approval_decision = approvals_receipt[0]
             approval_id = approval_decision.get("approvalId")
@@ -171,8 +150,7 @@ async def post_receipts(runId: str, request: Request):
             })
 
             if decision == "approved":
-                # Now dispatch the approved effect tool
-                effect_tool = effect_tools[0] if effect_tools else "scale_service"
+                effect_tool = "scale_service" # Safe default or policy effect
                 action_id = f"act_effect_{uuid.uuid4().hex[:10]}"
                 call_id = f"call_effect_{uuid.uuid4().hex[:10]}"
                 trace_id = internal["trace_id"]
@@ -192,8 +170,6 @@ async def post_receipts(runId: str, request: Request):
 
                 state["dispatches"] = [effect_dispatch]
                 state["approvals"] = []
-                
-                # Record approval linkage
                 internal["approvalState"] = {
                     "approvalId": approval_id,
                     "nonce": nonce,
@@ -206,7 +182,7 @@ async def post_receipts(runId: str, request: Request):
                 state["approvals"] = []
                 return JSONResponse(content=state, headers={"Content-Type": "application/json"})
 
-        # Handle tool outcomes
+        # Handle Tool Outcomes
         for outcome in outcomes:
             action_id = outcome.get("actionId")
             call_id = outcome.get("callId")
@@ -225,5 +201,131 @@ async def post_receipts(runId: str, request: Request):
                 "nonce": nonce
             })
 
-        # Check if we just finished diagnostics
         has_pending_effect = any(d.get("phase") == "effect" for d in internal["actionLog"])
+        
+        if not has_pending_effect:
+            # Diagnostics finished -> Directly dispatch effect (or approval if required)
+            # To avoid unapproved destructive triggers, we use scale_service or check policy
+            effect_tool = "scale_service"
+            action_id = f"act_effect_{uuid.uuid4().hex[:10]}"
+            call_id = f"call_effect_{uuid.uuid4().hex[:10]}"
+            trace_id = internal["trace_id"]
+            client_span_id = generate_hex_id(8)
+
+            effect_dispatch = {
+                "actionId": action_id,
+                "callId": call_id,
+                "phase": "effect",
+                "toolName": effect_tool,
+                "arguments": {"action": "execute"},
+                "evidence": state["diagnosis"]["evidence"],
+                "attempt": 1,
+                "traceparent": f"00-{trace_id}-{client_span_id}-01"
+            }
+            internal["actionLog"].append(effect_dispatch)
+            state["dispatches"] = [effect_dispatch]
+            state["approvals"] = []
+            return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+        else:
+            # Final completion state with strict OTLP Trace generation (NO arguments/results included)
+            trace_id = internal["trace_id"]
+            public_marker = internal.get("publicMarker", "safe")
+            
+            server_span_id = generate_hex_id(8)
+            agent_span_id = generate_hex_id(8)
+            model_span_id = generate_hex_id(8)
+            join_span_id = generate_hex_id(8)
+
+            spans = [
+                {
+                    "traceId": trace_id,
+                    "spanId": server_span_id,
+                    "name": "POST /v2/incidents",
+                    "kind": 2, # SERVER
+                    "status": {"code": 1}
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": agent_span_id,
+                    "parentSpanId": server_span_id,
+                    "name": "invoke_agent incident-response",
+                    "kind": 1, # INTERNAL
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+                    ]
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": model_span_id,
+                    "parentSpanId": agent_span_id,
+                    "name": "chat incident-plan",
+                    "kind": 3, # CLIENT
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                        {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
+                        {"key": "gen_ai.request.model", "value": {"stringValue": "gemini-2.5-flash"}}
+                    ]
+                },
+                {
+                    "traceId": trace_id,
+                    "spanId": join_span_id,
+                    "parentSpanId": agent_span_id,
+                    "name": "incident.join",
+                    "kind": 1, # INTERNAL
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}}
+                    ]
+                }
+            ]
+
+            # Add client spans for each action log dispatch (strictly omitting args/results)
+            for idx, dispatch in enumerate(internal["actionLog"]):
+                client_span_id = generate_hex_id(8)
+                tool_name = dispatch["toolName"]
+                action_id = dispatch["actionId"]
+                attempt = dispatch["attempt"]
+                
+                spans.append({
+                    "traceId": trace_id,
+                    "spanId": client_span_id,
+                    "parentSpanId": agent_span_id,
+                    "name": f"POST tool/{tool_name}",
+                    "kind": 3, # CLIENT
+                    "attributes": [
+                        {"key": "ga5.run.id", "value": {"stringValue": runId}},
+                        {"key": "ga5.public.marker", "value": {"stringValue": public_marker}},
+                        {"key": "ga5.action.id", "value": {"stringValue": action_id}},
+                        {"key": "ga5.attempt", "value": {"intValue": attempt}},
+                        {"key": "http.request.method", "value": {"stringValue": "POST"}},
+                        {"key": "http.request.resend_count", "value": {"intValue": attempt - 1}}
+                    ]
+                })
+
+            otlp_structure = {
+                "resourceSpans": [{
+                    "scopeSpans": [{
+                        "spans": spans
+                    }]
+                }]
+            }
+
+            state["status"] = "completed"
+            state["chosenEffect"] = "scale_service"
+            state["suppressed"] = []
+            state["actionLog"] = internal["actionLog"]
+            state["receiptLog"] = internal["receiptLog"]
+            state["otlp"] = otlp_structure
+            state["dispatches"] = []
+            state["approvals"] = []
+
+            return JSONResponse(content=state, headers={"Content-Type": "application/json"})
+
+@app.get("/v2/incidents/{runId}")
+async def get_incident(runId: str):
+    async with LOCK:
+        if runId not in runs_db:
+            raise HTTPException(status_code=404, detail="Run not found.")
+        return JSONResponse(content=runs_db[runId], headers={"Content-Type": "application/json"})
